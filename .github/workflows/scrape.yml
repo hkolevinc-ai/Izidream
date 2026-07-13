@@ -1,0 +1,31 @@
+name: Scrape Izidream
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Product limit (0 = all products)"
+        required: true
+        default: "20"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run scraper
+        run: python scraper.py --template template.xlsx --limit "${{ github.event.inputs.limit }}"
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: izidream-results
+          path: |
+            TEMU_IZIDREAM_UPLOAD.xlsx
+            izidream_raw_export.csv
+          retention-days: 14
