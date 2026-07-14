@@ -55,3 +55,10 @@ pip install -r requirements.txt
 python scraper.py --limit 20
 python scraper.py --limit 0
 ```
+
+## Red percentage fields fix (v1.2)
+- Every category-required material/composition option is written as a numeric value.
+- Unselected red percentage fields are written as `0` instead of being left blank.
+- Each required material group is normalized to exactly `100%`.
+- Material detection uses the labelled Material/Face Fabric/Filling/Core sections to avoid false matches such as `лен` inside `неизбелван` or `пера` inside `пералня`.
+- Validation fails if any red percentage cell is blank, non-numeric, or the group total differs from `100`.

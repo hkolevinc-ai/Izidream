@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 
 BASE_URL = "https://izidream.bg/"
-USER_AGENT = "Mozilla/5.0 (compatible; IzidreamTemuExporter/1.1; +https://izidream.bg/)"
+USER_AGENT = "Mozilla/5.0 (compatible; IzidreamTemuExporter/1.2; +https://izidream.bg/)"
 
 # More-specific rules must be placed before broad rules.
 CATEGORY_RULES = [
@@ -601,78 +601,129 @@ def extract_color(product: Product) -> str:
     return matches[0] if matches else "Multicolor"
 
 
-MATERIAL_SYNONYMS = {
-    "Cotton": ("памук", "ранфорс"),
-    "Polyester": ("полиестер", "пе", "п.е", "микрофибър", "микросатен", "шерпа", "полар", "кадифе"),
-    "Viscose": ("вискоза",),
-    "Linen": ("лен", "ленен"),
-    "Silk": ("коприна", "копринен"),
-    "Wool": ("вълна", "вълнен"),
-    "Nylon": ("найлон",),
-    "Lyocell": ("лиосел",),
-    "Polyurethane": ("полиуретан",),
-    "bamboo": ("бамбук", "бамбуков"),
+MATERIAL_PATTERNS = {
+    "Cotton": r"(?:памук|памучн\w*|ранфорс)",
+    "Polyester": r"(?:полиестер|микрофибър|микросатен|полар\w*|шерпа|кадифе|\bп\.?\s*е\.?\b)",
+    "Viscose": r"(?:вискоза|вискоз\w*)",
+    "Linen": r"(?<![а-я])лен(?:ен|ена|ени|ено)?(?![а-я])",
+    "Silk": r"(?:коприна|копринен\w*)",
+    "Wool": r"(?:вълна|вълнен\w*)",
+    "Nylon": r"(?:найлон|найлонов\w*)",
+    "Lyocell": r"(?:лиосел|lyocell)",
+    "Polyurethane": r"(?:полиуретан\w*)",
+    "bamboo": r"(?:бамбук|бамбуков\w*)",
+    "Acrylic": r"(?:акрил|акрилен\w*)",
+    "Elastane": r"(?:еластан\w*)",
+    "Polypropylene": r"(?:полипропилен\w*)",
+    "Polyamide": r"(?:полиамид\w*)",
+    "Polyethylene": r"(?:полиетилен\w*)",
+    "Modal": r"(?<![а-я])модал(?![а-я])",
 }
 
+SECTION_LABELS = [
+    "продукт", "форма", "материя", "материал", "състав лицев плат", "лицев плат",
+    "долен плат", "горен плат", "състав пълнеж", "пълнеж", "състав ядро", "ядро",
+    "размери", "размер", "цвят", "вид", "граматура", "грамаж", "начин на изработка",
+    "поддръжка", "подръжка", "доставка", "страна на произход", "опции", "борд",
+    "комплектът съдържа", "комплектът включва", "закопчаване", "плътност",
+]
+SECTION_STOP_PATTERN = "|".join(sorted((re.escape(x) for x in SECTION_LABELS), key=len, reverse=True))
 
-def _material_percent(text: str, synonyms: tuple[str, ...]) -> float | None:
-    escaped = "|".join(re.escape(x) for x in synonyms)
+
+def labeled_sections(text: str, labels: tuple[str, ...]) -> list[str]:
+    labels_pattern = "|".join(sorted((re.escape(x) for x in labels), key=len, reverse=True))
+    pattern = re.compile(
+        rf"(?:^|[•.;]\s*|\s)(?:{labels_pattern})\s*:\s*(.*?)"
+        rf"(?=(?:\s+[•.;]?\s*(?:{SECTION_STOP_PATTERN})\s*:)|$)",
+        re.IGNORECASE,
+    )
+    return [
+        match.group(1).strip(" •.;")
+        for match in pattern.finditer(text or "")
+        if match.group(1).strip(" •.;")
+    ]
+
+
+def material_percent(text: str, material_pattern: str) -> float | None:
     patterns = [
-        rf"(\d{{1,3}}(?:[.,]\d+)?)\s*%\s*(?:[^.;,]{{0,22}})?(?:{escaped})",
-        rf"(?:{escaped})(?:[^.;,]{{0,22}})?(\d{{1,3}}(?:[.,]\d+)?)\s*%",
+        rf"(\d{{1,3}}(?:[.,]\d+)?)\s*%\s*(?:[^,;/]{{0,35}})?(?:{material_pattern})",
+        rf"(?:{material_pattern})(?:[^,;/]{{0,35}})?(\d{{1,3}}(?:[.,]\d+)?)\s*%",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return min(100.0, max(0.0, parse_number(match.group(1))))
+            return max(0.0, min(100.0, parse_number(match.group(1))))
     return None
 
 
-def extract_materials(product: Product) -> dict[str, float]:
-    text = f"{product.name} {product.description}".casefold()
+def normalize_percentages(values: dict[str, float]) -> dict[str, float]:
+    clean = {key: float(value) for key, value in values.items() if value is not None and value > 0}
+    if not clean:
+        return {}
+    total = sum(clean.values())
+    keys = list(clean)
     result: dict[str, float] = {}
-    mentioned = []
-    for material, synonyms in MATERIAL_SYNONYMS.items():
-        if any(s in text for s in synonyms):
-            mentioned.append(material)
-            percent = _material_percent(text, synonyms)
-            if percent is not None:
-                result[material] = percent
-    if result:
-        total = sum(result.values())
-        if total > 100.5:
-            result = {k: round(v * 100 / total, 1) for k, v in result.items()}
-        elif total < 99.5 and len(result) == 1:
-            only = next(iter(result))
-            result[only] = 100.0
-        return result
-    if len(mentioned) == 1:
-        return {mentioned[0]: 100.0}
-    if len(mentioned) > 1:
-        share = round(100 / len(mentioned), 1)
-        return {m: share for m in mentioned}
+    accumulated = 0.0
+    for key in keys[:-1]:
+        value = round(clean[key] * 100 / total, 1)
+        result[key] = value
+        accumulated += value
+    result[keys[-1]] = round(100.0 - accumulated, 1)
+    return result
+
+
+def extract_materials(product: Product) -> dict[str, float]:
+    text = f"{product.name} {product.description}"
+    sections = labeled_sections(
+        product.description,
+        ("състав лицев плат", "лицев плат", "долен плат", "горен плат", "материя", "материал", "състав"),
+    )
+    contexts = sections if sections else [text]
+
+    explicit: dict[str, float] = {}
+    for section in contexts:
+        for material, pattern in MATERIAL_PATTERNS.items():
+            if re.search(pattern, section, re.IGNORECASE):
+                percentage = material_percent(section, pattern)
+                if percentage is not None:
+                    explicit[material] = explicit.get(material, 0.0) + percentage
+    if explicit:
+        return normalize_percentages(explicit)
+
+    context = " ".join(
+        re.sub(r"екстракт от\s+\w+", "", section, flags=re.IGNORECASE)
+        for section in contexts
+    )
+    mentioned = [
+        material for material, pattern in MATERIAL_PATTERNS.items()
+        if re.search(pattern, context, re.IGNORECASE)
+    ]
+    if mentioned:
+        return normalize_percentages({material: 1.0 for material in mentioned})
     return {"Polyester": 100.0}
-
-
-FILLING_SYNONYMS = [
-    (("мемори",), "Memory foam"),
-    (("полиуретанова пяна", "полиуретаново ядро", "полиуретанова"), "Polyurethane Foam"),
-    (("латекс",), "Latex"),
-    (("вълна", "вълнен пълнеж"), "Wool"),
-    (("памучен пълнеж",), "Cotton"),
-    (("силиконов пух", "силиконова вата", "силиконово влакно", "силиконов пълнеж"), "Silicone Fiber"),
-    (("пух", "пера"), "Down"),
-    (("полиестер", "пе", "вата", "рециклируем материал"), "Polyester"),
-]
 
 
 def extract_filling_materials(product: Product) -> dict[str, float]:
-    text = f"{product.name} {product.description}".casefold()
-    for needles, material in FILLING_SYNONYMS:
-        if any(n in text for n in needles):
+    text = f"{product.name} {product.description}"
+    sections = labeled_sections(product.description, ("състав пълнеж", "пълнеж", "състав ядро", "ядро"))
+    context = " ".join(sections) if sections else text
+    patterns = [
+        ("Memory foam", r"мемори"),
+        ("Polyurethane Foam", r"(?:полиуретан|дунапрен)"),
+        ("Latex", r"латекс"),
+        ("Wool", r"(?:вълна|вълнен)"),
+        ("Cotton", r"памучн"),
+        ("Silicone Fiber", r"силиконов\w*\s*(?:пух|вата|влакн\w*)"),
+        ("Duck Down", r"патешк\w*\s+пух"),
+        ("goose down", r"гъш\w*\s+пух"),
+        ("feather", r"\bпера\b"),
+        ("Down", r"\bпух\b"),
+        ("Polyester", r"(?:полиестер|\bп\.?\s*е\.?\b|хипоалерген\w*\s+вата|\bвата\b)"),
+    ]
+    for material, pattern in patterns:
+        if re.search(pattern, context, re.IGNORECASE):
             return {material: 100.0}
     return {"Polyester": 100.0}
-
 
 def closest_allowed(value: str, allowed: list[str], default: str | None = None) -> str:
     if value in allowed:
@@ -741,29 +792,42 @@ def property_group(technical_header: str) -> tuple[str, str] | None:
 
 def fill_option_group(ws, row: int, cols: list[int], display: dict[int, str], values: dict[str, float]) -> None:
     available = {display[col].split(":", 1)[1].casefold(): col for col in cols if ":" in display[col]}
-    written = False
-    for option, percentage in values.items():
-        aliases = [option]
-        if option == "bamboo":
-            aliases += ["Bamboo", "Viscose", "Other Fibers", "Other Materials"]
-        if option == "Polyurethane Foam":
-            aliases += ["Polyurethane", "Foam"]
-        if option == "Silicone Fiber":
-            aliases += ["Silicone", "Polyester"]
-        for alias in aliases:
-            col = available.get(alias.casefold())
-            if col:
-                ws.cell(row, col).value = round(percentage, 1)
-                written = True
-                break
-    if not written and cols:
-        # Prefer common textile fallbacks instead of an arbitrary exotic option.
-        for fallback in ("polyester", "cotton", "n/a"):
-            if fallback in available:
-                ws.cell(row, available[fallback]).value = 100
-                return
-        ws.cell(row, cols[0]).value = 100
 
+    # Temu treats every red percentage cell in the group as required. Unselected
+    # options must therefore contain numeric zero, not be left blank.
+    for col in cols:
+        ws.cell(row, col).value = 0.0
+
+    aliases_by_option = {
+        "bamboo": ["Bamboo", "Viscose", "Other Fibers", "Other Materials", "Polyester"],
+        "Polyurethane Foam": ["Polyurethane Foam", "Polyurethane", "Foam", "sponge"],
+        "Silicone Fiber": ["Silicone Fiber", "Silicone", "Polyester"],
+        "Memory foam": ["Memory foam", "Foam", "Polyurethane Foam"],
+        "Duck Down": ["Duck Down", "Down"],
+        "goose down": ["goose down", "Down"],
+        "feather": ["feather", "Down"],
+        "Down": ["Down", "down substitute", "Polyester"],
+        "Modal": ["Modal", "Other Fibers", "Viscose"],
+    }
+
+    mapped: dict[int, float] = {}
+    for option, percentage in values.items():
+        candidates = aliases_by_option.get(option, [option])
+        target_col = next((available[x.casefold()] for x in candidates if x.casefold() in available), None)
+        if target_col is None:
+            target_col = next(
+                (available[x] for x in ("polyester", "cotton", "n/a", "other materials") if x in available),
+                cols[0] if cols else None,
+            )
+        if target_col is not None:
+            mapped[target_col] = mapped.get(target_col, 0.0) + float(percentage)
+
+    if not mapped and cols:
+        mapped[cols[0]] = 100.0
+
+    normalized = normalize_percentages({str(col): value for col, value in mapped.items()})
+    for col_str, percentage in normalized.items():
+        ws.cell(row, int(col_str)).value = round(percentage, 1)
 
 def fill_required_attributes(
     ws,
@@ -785,8 +849,6 @@ def fill_required_attributes(
         if group:
             grouped.setdefault(group[0], []).append(col)
     for property_id, cols in grouped.items():
-        if any(ws.cell(row, col).value not in (None, "") for col in cols):
-            continue
         label = display[cols[0]].split(":", 1)[0].casefold()
         if property_id == "2018" or "filling material" in label:
             fill_option_group(ws, row, cols, display, extract_filling_materials(product))
@@ -984,8 +1046,17 @@ def validate_output(path: Path, expected_rows: int) -> None:
             else:
                 simple_cols.append(col)
         for property_id, cols in option_groups.items():
-            if not any(ws.cell(row, col).value not in (None, "") for col in cols):
-                errors.append(f"row {row}: required attribute group {display[cols[0]].split(':', 1)[0]} is blank")
+            values = [ws.cell(row, col).value for col in cols]
+            if any(value in (None, "") for value in values):
+                errors.append(f"row {row}: required attribute group {display[cols[0]].split(':', 1)[0]} contains blank red cells")
+                continue
+            try:
+                total = sum(float(value) for value in values)
+            except (TypeError, ValueError):
+                errors.append(f"row {row}: required attribute group {display[cols[0]].split(':', 1)[0]} contains a non-numeric value")
+                continue
+            if abs(total - 100.0) > 0.11:
+                errors.append(f"row {row}: required attribute group {display[cols[0]].split(':', 1)[0]} totals {total:g}, expected 100")
         for col in simple_cols:
             value = ws.cell(row, col).value
             # List price may be replaced by the explicit N/A field.
