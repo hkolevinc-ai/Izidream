@@ -725,6 +725,56 @@ def extract_filling_materials(product: Product) -> dict[str, float]:
             return {material: 100.0}
     return {"Polyester": 100.0}
 
+
+def choose_count_value(product: Product, allowed: list[str]) -> str:
+    """Choose a valid Temu Count value from the category dropdown."""
+    if not allowed:
+        return ""
+    text = f"{product.name} {product.description}".casefold()
+    explicit = re.search(
+        r"(?<!\d)(\d{2,3})\s*(?:count|нишк(?:а|и)(?:\s*/\s*см(?:2|²))?)",
+        text,
+        re.IGNORECASE,
+    )
+    target: int | None = int(explicit.group(1)) if explicit else None
+    if target is None:
+        if "сатен" in text and "микросатен" not in text:
+            target = 60
+        elif "перкал" in text:
+            target = 40
+        elif "ранфорс" in text:
+            target = 30
+        elif any(x in text for x in ("бамбук", "вискоза", "лиосел")):
+            target = 40
+        elif any(x in text for x in ("коприна", "копринен")):
+            target = 80
+        else:
+            target = 30
+    numeric: list[tuple[int, str]] = []
+    for option in allowed:
+        match = re.match(r"^(\d{1,3})\s*count$", option, re.IGNORECASE)
+        if match:
+            numeric.append((int(match.group(1)), option))
+    return min(numeric, key=lambda item: abs(item[0] - target))[1] if numeric else allowed[0]
+
+
+def extract_cover_fiber_composition(product: Product) -> dict[str, float]:
+    """Map materials to the limited conditional 8653 composition options."""
+    materials = extract_materials(product)
+    aliases = {
+        "Silk": "Silk", "Elastane": "Elastane", "Acrylic": "Acrylic",
+        "Viscose": "Viscose", "bamboo": "Viscose", "Modal": "Viscose",
+        "Lyocell": "Viscose", "Wool": "Wool", "Cashmere": "Wool",
+        "Polyurethane": "Non-textile Components",
+    }
+    mapped: dict[str, float] = {}
+    for material, percentage in materials.items():
+        target = aliases.get(material)
+        if target:
+            mapped[target] = mapped.get(target, 0.0) + float(percentage)
+    return normalize_percentages(mapped)
+
+
 def closest_allowed(value: str, allowed: list[str], default: str | None = None) -> str:
     if value in allowed:
         return value
@@ -877,7 +927,7 @@ def fill_required_attributes(
         elif "square gram weight" in label_l:
             value = closest_allowed("150-160g", allowed, allowed[0] if allowed else "150-160g")
         elif "fibre composition" in label_l:
-            value = "Yes"
+            value = "Yes" if extract_cover_fiber_composition(product) else "No"
         elif "applicable age" in label_l:
             preferred = "Infant" if any(x in text.casefold() for x in ("беб", "кошара", "детск")) else "Adult"
             match = next((x for x in allowed if preferred.casefold() in x.casefold()), None)
@@ -885,6 +935,29 @@ def fill_required_attributes(
         else:
             value = allowed[0] if allowed else "Not Applicable"
         ws.cell(row, col).value = value
+
+    # Conditional Count field (JM). It is not included in ordinary *_require rows.
+    count_col = first_col(mapping, "t_3_Property:6260|2021")
+    count_allowed = dropdowns.get(f"t_3_{category}_6260 - Count", [])
+    has_required_cover_group = any(
+        (property_group(technical.get(col, "")) or (None, None))[0] == "2021"
+        for col in required_cols
+    )
+    if count_col and (count_allowed or has_required_cover_group):
+        allowed = count_allowed or ["30 count"]
+        ws.cell(row, count_col).value = choose_count_value(product, allowed)
+
+    # Conditional Cover Fiber Composition (PQ:PV), controlled by PP.
+    fibre_flag_col = first_col(mapping, "t_3_Property:8647")
+    fibre_cols = [col for col, tech in technical.items() if tech.startswith("t_3_Property:8653:")]
+    if fibre_flag_col and ws.cell(row, fibre_flag_col).value not in (None, ""):
+        composition = extract_cover_fiber_composition(product)
+        ws.cell(row, fibre_flag_col).value = "Yes" if composition else "No"
+        if composition and fibre_cols:
+            fill_option_group(ws, row, fibre_cols, display, composition)
+        else:
+            for col in fibre_cols:
+                ws.cell(row, col).value = None
 
     # Variation fields.
     theme_col = first_col(mapping, "t_4_Variation Theme")
@@ -1027,6 +1100,7 @@ def validate_output(path: Path, expected_rows: int) -> None:
     ws = book["Template"]
     mapping = header_map(ws)
     display, technical = template_headers(ws)
+    dropdowns = read_dropdowns(book)
     required_by_category = read_required_columns(book)
     start_row = 5
 
@@ -1066,6 +1140,36 @@ def validate_output(path: Path, expected_rows: int) -> None:
                     errors.append(f"row {row}: List Price and N/A are both blank")
             elif value in (None, ""):
                 errors.append(f"row {row}: required field {display.get(col) or technical.get(col)} is blank")
+
+        count_col = first_col(mapping, "t_3_Property:6260|2021")
+        count_allowed = dropdowns.get(f"t_3_{category}_6260 - Count", [])
+        has_required_cover_group = any(
+            (property_group(technical.get(col, "")) or (None, None))[0] == "2021"
+            for col in required_cols
+        )
+        if count_col and (count_allowed or has_required_cover_group):
+            count_value = clean_text(ws.cell(row, count_col).value)
+            if not count_value:
+                errors.append(f"row {row}: conditional Count (JM) is blank")
+            elif count_allowed and count_value not in count_allowed:
+                errors.append(f"row {row}: Count value {count_value!r} is not valid for category {category}")
+
+        fibre_flag_col = first_col(mapping, "t_3_Property:8647")
+        fibre_cols = [col for col, tech in technical.items() if tech.startswith("t_3_Property:8653:")]
+        fibre_flag = clean_text(ws.cell(row, fibre_flag_col).value) if fibre_flag_col else ""
+        if fibre_flag == "Yes":
+            fibre_values = [ws.cell(row, col).value for col in fibre_cols]
+            if any(value in (None, "") for value in fibre_values):
+                errors.append(f"row {row}: conditional Cover Fiber Composition contains blank cells")
+            else:
+                try:
+                    fibre_total = sum(float(value) for value in fibre_values)
+                except (TypeError, ValueError):
+                    errors.append(f"row {row}: Cover Fiber Composition contains a non-numeric value")
+                else:
+                    if abs(fibre_total - 100.0) > 0.11:
+                        errors.append(f"row {row}: Cover Fiber Composition totals {fibre_total:g}, expected 100")
+
         # Validate conditional custom variation fields for generic categories.
         theme_col = first_col(mapping, "t_4_Variation Theme")
         theme = clean_text(ws.cell(row, theme_col).value) if theme_col else ""

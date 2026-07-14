@@ -62,3 +62,10 @@ python scraper.py --limit 0
 - Each required material group is normalized to exactly `100%`.
 - Material detection uses the labelled Material/Face Fabric/Filling/Core sections to avoid false matches such as `лен` inside `неизбелван` or `пера` inside `пералня`.
 - Validation fails if any red percentage cell is blank, non-numeric, or the group total differs from `100`.
+
+## Conditional JM / PQ fix (v1.3)
+- `JM - Count` is populated whenever the template's conditional rule makes it mandatory.
+- Values are selected from the category dropdown; categories without a dropdown use the conservative standard `30 count` fallback.
+- `PP - Fibre composition` is no longer set to `Yes` automatically.
+- `PQ:PV - Cover Fiber Composition` is filled only when the material maps to the supported options. Cotton/polyester-only products use `PP = No`, so the scraper does not invent a Silk percentage.
+- Output validation checks conditional Count and conditional Cover Fiber Composition before upload.
